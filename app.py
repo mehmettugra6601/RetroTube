@@ -1,223 +1,147 @@
-from flask import Flask, request, render_template_string, Response, stream_with_context
-import yt_dlp
+import os
+from flask import Flask, render_template_string, request, Response
 import requests
+import yt_dlp
 
 app = Flask(__name__)
 
-BASE_HTML = '''
+# Android 2.3 tarayıcıları için ultra hafif HTML arayüzü
+HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html>
 <head>
     <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
-    <title>Retro YT Proxy</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Retro Tube</title>
     <style>
-        body { font-family: sans-serif; background: #e6e6e6; margin: 0; padding: 5px; font-size: 12px; }
-        .header { background: #cc0000; color: #fff; padding: 6px; text-align: center; font-weight: bold; margin-bottom: 8px; }
-        .search-box { background: #fff; padding: 8px; border: 1px solid #ccc; margin-bottom: 8px; text-align: center; }
-        input[type="text"] { width: 60%; padding: 4px; }
-        input[type="submit"] { padding: 4px 8px; background: #333; color: #fff; border: none; font-weight: bold; }
-        .video-item { background: #fff; padding: 6px; border: 1px solid #ccc; margin-bottom: 6px; overflow: hidden; }
-        .video-item img { float: left; margin-right: 8px; width: 80px; height: 60px; }
-        .video-item a { color: #003399; text-decoration: none; font-weight: bold; display: block; }
-        .btn-back { display: inline-block; background: #555; color: #fff; padding: 4px 8px; text-decoration: none; margin-bottom: 8px; font-size: 11px; }
-        .play-btn { display: block; background: #28a745; color: #fff; padding: 12px; text-decoration: none; font-weight: bold; font-size: 13px; border-radius: 4px; text-align: center; margin: 8px 0; }
-        .dl-btn { display: block; background: #6c757d; color: #fff; padding: 10px; text-decoration: none; font-weight: bold; font-size: 12px; border-radius: 4px; text-align: center; margin-top: 6px; }
-        .quality-box { margin: 10px 0; padding: 6px; background: #f8f9fa; border: 1px solid #ddd; }
-        .q-btn { display: inline-block; padding: 4px 8px; text-decoration: none; font-size: 11px; margin: 2px; border-radius: 3px; }
-        .clear { clear: both; }
+        body { font-family: sans-serif; background: #121212; color: #fff; text-align: center; padding: 10px; margin:0; }
+        input[type="text"] { padding: 8px; font-size: 14px; width: 60%; }
+        button { padding: 8px 12px; font-size: 14px; background: #ff0000; color: #fff; border: none; cursor: pointer; }
+        .card { border: 1px solid #333; margin: 10px auto; padding: 10px; background: #1e1e1e; max-width: 500px; text-align: left; }
+        a.play-btn { display: inline-block; padding: 6px 12px; background: #0088cc; color: #fff; text-decoration: none; font-weight: bold; border-radius: 3px; margin-top: 5px; }
     </style>
 </head>
 <body>
-    <div class="header">Retro YT Proxy</div>
-    {% block content %}{% endblock %}
-</body>
-</html>
-'''
+    <h2>📺 Retro Tube</h2>
+    <form action="/" method="get">
+        <input type="text" name="q" placeholder="Video ara veya YouTube linki yapıştır..." value="{{ query }}">
+        <button type="submit">Ara</button>
+    </form>
+    <hr style="border-color:#333;">
 
-INDEX_TEMPLATE = BASE_HTML.replace('{% block content %}{% endblock %}', '''
-    <div class="search-box">
-        <form action="/" method="get">
-            <input type="text" name="q" value="{{ query }}" placeholder="Video ara...">
-            <input type="submit" value="Ara">
-        </form>
-    </div>
-
-    {% if results %}
-        {% for video in results %}
-            <div class="video-item">
-                <a href="/watch?v={{ video.id }}">
-                    <img src="{{ video.thumbnail }}" alt="thumb">
-                    {{ video.title }}
-                </a>
-                <div style="color: #666; font-size: 10px; margin-top: 4px;">Kanal: {{ video.uploader }}</div>
-                <div class="clear"></div>
+    {% if videos %}
+        {% for v in videos %}
+            <div class="card">
+                <strong>{{ v.title }}</strong><br>
+                <small style="color:#aaa;">Kanal: {{ v.uploader }}</small><br>
+                <a class="play-btn" href="/stream/{{ v.id }}">▶️ QQPlayer İle Oynat</a>
+                <a class="play-btn" style="background:#444;" href="/watch/{{ v.id }}">🌐 Web'de Aç</a>
             </div>
         {% endfor %}
     {% endif %}
-''')
+</body>
+</html>
+"""
 
-WATCH_TEMPLATE = BASE_HTML.replace('{% block content %}{% endblock %}', '''
-    <a href="javascript:history.back()" class="btn-back">&laquo; Geri Dön</a>
-    <div style="background:#fff; padding:8px; font-size:12px; border:1px solid #ccc; margin-bottom:10px;">
-        <b>{{ video.title }}</b><br>
-        <span style="font-size:10px; color:#666;">Kanal: {{ video.uploader }}</span>
-    </div>
-    
-    <div style="text-align:center; background:#fff; padding:10px; border:1px solid #ccc;">
-        <img src="{{ video.thumbnail }}" width="180" style="border:1px solid #999; margin-bottom:5px;"><br>
-        
-        <div class="quality-box">
-            <b style="font-size:11px;">Kalite Seçin:</b><br>
-            <a href="/watch?v={{ video.id }}&fmt=17" class="q-btn" style="background:{% if current_fmt == '17' %}#007bff{% else %}#e0e0e0{% endif %}; color:{% if current_fmt == '17' %}#fff{% else %}#000{% endif %};">144p (En Hafif)</a>
-            <a href="/watch?v={{ video.id }}&fmt=18" class="q-btn" style="background:{% if current_fmt == '18' %}#007bff{% else %}#e0e0e0{% endif %}; color:{% if current_fmt == '18' %}#fff{% else %}#000{% endif %};">360p (Net)</a>
-            <a href="/watch?v={{ video.id }}&fmt=auto" class="q-btn" style="background:{% if current_fmt == 'auto' %}#007bff{% else %}#e0e0e0{% endif %}; color:{% if current_fmt == 'auto' %}#fff{% else %}#000{% endif %};">Otomatik</a>
-        </div>
-        
-        <a href="/stream.mp4?v={{ video.id }}&fmt={{ current_fmt }}" class="play-btn">
-            ▶ Oynat (QQPlayer)
-        </a>
-        
-        <a href="/download.mp4?v={{ video.id }}&fmt={{ current_fmt }}" class="dl-btn">
-            💾 Videoyu Telefona İndir (MP4)
-        </a>
-    </div>
-''')
 
-def clean_filename(title):
-    """HTTP Header hatası vermesin diye Türkçe/Unicode karakterleri ASCII'ye çevirir."""
-    replacements = {
-        'ı': 'i', 'İ': 'I', 'ğ': 'g', 'Ğ': 'G',
-        'ü': 'u', 'Ü': 'U', 'ş': 's', 'Ş': 'S',
-        'ö': 'o', 'Ö': 'O', 'ç': 'c', 'Ç': 'C'
-    }
-    for tr, en in replacements.items():
-        title = title.replace(tr, en)
-    
-    cleaned = "".join([c for c in title if c.isascii() and (c.isalnum() or c in (' ', '_', '-'))]).strip()
-    return cleaned or "video"
+def get_yt_stream_info(video_id):
+  """YouTube video bilgilerini ve eski cihazlara uygun akış bağlantısını çeker."""
+  url = f'https://www.youtube.com/watch?v={video_id}'
+  ydl_opts = {
+      # 18: 360p MP4 (H.264/AAC) -> Galaxy Y ve QQPlayer için EN UYUMLU formattır
+      # 17: 144p 3GP -> Aşırı düşük bağlantılar için yedek
+      'format': '18/17/worst[ext=mp4]/worst',
+      'quiet': True,
+      'no_warnings': True,
+  }
+  with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+    info = ydl.extract_info(url, download=False)
+    return info.get('url'), info.get('http_headers', {})
 
-def get_format_spec(fmt):
-    if fmt == '17':
-        return '17/worst[ext=mp4]'
-    elif fmt == '18':
-        return '18/worst[ext=mp4]'
-    else:
-        return '18/17/worst[ext=mp4]/worst'
 
 @app.route('/')
 def index():
-    query = request.args.get('q', '')
-    results = []
-    if query:
-        ydl_opts = {
-            'quiet': True,
-            'extract_flat': 'in_playlist',
-            'skip_download': True,
-        }
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            try:
-                info = ydl.extract_info(f"ytsearch10:{query}", download=False)
-                if 'entries' in info:
-                    for entry in info['entries']:
-                        results.append({
-                            'id': entry.get('id'),
-                            'title': entry.get('title', 'Başlıksız'),
-                            'uploader': entry.get('uploader', 'Bilinmiyor'),
-                            'thumbnail': f"https://i.ytimg.com/vi/{entry.get('id')}/hqdefault.jpg"
-                        })
-            except Exception as e:
-                print(f"Arama hatası: {e}")
-
-    return render_template_string(INDEX_TEMPLATE, query=query, results=results)
-
-@app.route('/watch')
-def watch():
-    video_id = request.args.get('v')
-    fmt = request.args.get('fmt', '17')
-    if not video_id:
-        return redirect('/')
-    
-    video_info = {
-        'id': video_id,
-        'title': 'Video Yükleniyor...',
-        'uploader': 'YouTube',
-        'thumbnail': f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg"
-    }
-    
-    ydl_opts = {'quiet': True, 'skip_download': True}
+  query = request.args.get('q', '')
+  videos = []
+  if query:
+    # Arama query'si veya doğrudan link kontrolü
+    ydl_opts = {'quiet': True, 'extract_flat': True}
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        try:
-            info = ydl.extract_info(video_id, download=False)
-            video_info['title'] = info.get('title', 'Video')
-            video_info['uploader'] = info.get('uploader', 'Bilinmiyor')
-        except Exception:
-            pass
+      search_target = query if 'youtube.com' in query else f'ytsearch5:{query}'
+      res = ydl.extract_info(search_target, download=False)
+      entries = (
+          res.get('entries', []) if 'entries' in res else [res]
+      )  # Tek video veya arama
+      for entry in entries:
+        if entry:
+          videos.append({
+              'id': entry.get('id'),
+              'title': entry.get('title', 'Başlıksız Video'),
+              'uploader': entry.get('uploader', 'Bilinmiyor'),
+          })
+  return render_template_string(HTML_TEMPLATE, query=query, videos=videos)
 
-    return render_template_string(WATCH_TEMPLATE, video=video_info, current_fmt=fmt)
 
-@app.route('/stream.mp4')
-@app.route('/stream')
-def stream():
-    video_id = request.args.get('v')
-    fmt = request.args.get('fmt', '17')
-    if not video_id:
-        return "Video ID eksik", 400
+@app.route('/stream/<video_id>')
+def proxy_stream(video_id):
+  """QQPlayer / Eski Medya Oynatıcılar için Proxy Akışı (YouTube 403 Engeli Aşılır)."""
+  try:
+    direct_url, yt_headers = get_yt_stream_info(video_id)
 
-    ydl_opts = {
-        'quiet': True,
-        'format': get_format_spec(fmt),
+    # Oynatıcıdan gelen Range header'ını (sarma/buffering isteğini) yakalayalım
+    req_headers = {
+        'User-Agent': yt_headers.get('User-Agent', 'Mozilla/5.0'),
     }
-    
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        try:
-            info = ydl.extract_info(video_id, download=False)
-            stream_url = info.get('url')
-            
-            if stream_url:
-                req = requests.get(stream_url, stream=True, headers={'User-Agent': 'Mozilla/5.0'})
-                return Response(
-                    stream_with_context(req.iter_content(chunk_size=1024 * 64)),
-                    content_type='video/mp4'
-                )
-            else:
-                return "Video akış adresi alınamadı", 500
-        except Exception as e:
-            return f"Akış hatası: {str(e)}", 500
+    if 'Range' in request.headers:
+      req_headers['Range'] = request.headers['Range']
 
-@app.route('/download.mp4')
-@app.route('/download')
-def download():
-    video_id = request.args.get('v')
-    fmt = request.args.get('fmt', '17')
-    if not video_id:
-        return "Video ID eksik", 400
+    # YouTube'dan akışı canlı çekiyoruz
+    r = requests.get(direct_url, headers=req_headers, stream=True, timeout=15)
 
-    ydl_opts = {
-        'quiet': True,
-        'format': get_format_spec(fmt),
+    # Başlıkları medya oynatıcıya aktaralım
+    response_headers = {
+        'Content-Type': r.headers.get('Content-Type', 'video/mp4'),
+        'Accept-Ranges': 'bytes',
     }
-    
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        try:
-            info = ydl.extract_info(video_id, download=False)
-            stream_url = info.get('url')
-            title = info.get('title', video_id)
-            
-            # Türkçe karakterleri temizleyip ASCII uyumlu dosya adı üretiyoruz:
-            safe_filename = clean_filename(title)
-            
-            if stream_url:
-                req = requests.get(stream_url, stream=True, headers={'User-Agent': 'Mozilla/5.0'})
-                return Response(
-                    stream_with_context(req.iter_content(chunk_size=1024 * 64)),
-                    content_type='application/octet-stream',
-                    headers={"Content-Disposition": f'attachment; filename="{safe_filename}.mp4"'}
-                )
-            else:
-                return "Video adresi alınamadı", 500
-        except Exception as e:
-            return f"İndirme hatası: {str(e)}", 500
+    if 'Content-Length' in r.headers:
+      response_headers['Content-Length'] = r.headers['Content-Length']
+    if 'Content-Range' in r.headers:
+      response_headers['Content-Range'] = r.headers['Content-Range']
+
+    return Response(
+        r.iter_content(chunk_size=64 * 1024),
+        status=r.status_code,
+        headers=response_headers,
+        direct_passthrough=True,
+    )
+  except Exception as e:
+    return f'Akış Hatası: {str(e)}', 500
+
+
+@app.route('/watch/<video_id>')
+def watch(video_id):
+  """Basit HTML5 Video Sayfası."""
+  return render_template_string(
+      """
+    <!DOCTYPE html>
+    <html>
+    <head><meta charset="utf-8"><title>Oynatıcı</title></head>
+    <body style="background:#000; color:#fff; text-align:center; padding-top:20px;">
+        <video controls autoplay width="100%" height="auto">
+            <source src="/stream/{{ video_id }}" type="video/mp4">
+            Tarayıcınız video etiketini desteklemiyor.
+        </video>
+        <br><br>
+        <a style="color:#0088cc;" href="/stream/{{ video_id }}">Harici Oynatıcıda (QQPlayer) Aç</a> | 
+        <a style="color:#aaa;" href="/">Ana Sayfa</a>
+    </body>
+    </html>
+    """,
+      video_id=video_id,
+  )
+
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=8080, debug=True)
+  # Render'ın atadığı dinamik portu dinler
+  port = int(os.environ.get('PORT', 5000))
+  app.run(host='0.0.0.0', port=port)
